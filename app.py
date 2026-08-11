@@ -19,6 +19,8 @@ Requires `scraper.py` (providing `fetch_website_links` and
 import os
 import re
 import json
+import logging
+import traceback
 from datetime import datetime
 
 import streamlit as st
@@ -33,6 +35,9 @@ from scraper import fetch_website_links, fetch_website_contents
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("vendor_risk_console")
+
 st.set_page_config(
     page_title="Vendor Risk Console",
     page_icon="🛡️",
@@ -41,6 +46,8 @@ st.set_page_config(
 )
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+# NOTE: verify these model IDs against the live Gemini model list before
+# relying on the default — naming may have moved on since this was written.
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 FALLBACK_MODEL_OPTIONS = [
     "gemini-3.5-flash-lite",
@@ -212,18 +219,23 @@ st.markdown(
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_available_models(api_key: str) -> list:
+def fetch_available_models(_api_key: str) -> list:
     """
     Return the model IDs available to this API key, via the same
     OpenAI-compatible endpoint the rest of the app uses (no extra
     google-generativeai dependency). Cached for an hour per key so
     switching tabs doesn't re-hit the API. Returns [] on any failure
     so the caller can fall back to FALLBACK_MODEL_OPTIONS.
+
+    The leading underscore on `_api_key` tells Streamlit to exclude this
+    argument from its cache-key hashing — the key still selects which
+    cached result you get (via the function body), but the secret itself
+    never becomes part of a hash Streamlit stores or compares.
     """
-    if not api_key:
+    if not _api_key:
         return []
     try:
-        client = OpenAI(base_url=GEMINI_BASE_URL, api_key=api_key)
+        client = OpenAI(base_url=GEMINI_BASE_URL, api_key=_api_key)
         response = client.models.list()
         return sorted(m.id for m in response.data)
     except Exception:
@@ -288,15 +300,16 @@ def split_into_sections(markdown_text: str) -> dict:
 
 
 def extract_verdict(sections: dict) -> str:
+    """
+    Look for the pinned 'Verdict: Pass/Conditional/Fail' line specifically,
+    rather than scanning the whole Recommendations section for the bare
+    words. Scanning the whole section is unsafe: prose like "cancellation
+    terms could fail to meet enterprise needs" would false-positive a FAIL
+    verdict even when the actual verdict line says Pass.
+    """
     rec_text = sections.get(SECTION_ORDER[4], "") or ""
-    text = rec_text.lower()
-    if re.search(r"\bfail\b", text):
-        return "fail"
-    if re.search(r"\bconditional\b", text):
-        return "conditional"
-    if re.search(r"\bpass\b", text):
-        return "pass"
-    return "unknown"
+    match = re.search(r"verdict\s*:\s*(pass|conditional|fail)", rec_text, re.IGNORECASE)
+    return match.group(1).lower() if match else "unknown"
 
 
 def run_audit(company_name: str, url: str, api_key: str, model: str):
@@ -321,7 +334,8 @@ def run_audit(company_name: str, url: str, api_key: str, model: str):
             try:
                 page_content = fetch_website_contents(link["url"])
             except Exception as exc:
-                page_content = f"[Could not fetch this page: {exc}]"
+                logger.warning("Failed to fetch link %s: %s", link.get("url", ""), exc)
+                page_content = "[Could not fetch this page]"
             combined += f"\n\n### Link: {link.get('type', 'page')}\n{page_content}"
 
         status.update(label="Compiling due diligence dossier...")
@@ -446,6 +460,10 @@ if "history" not in st.session_state:
     st.session_state.history = []
 if "current" not in st.session_state:
     st.session_state.current = None
+if "live_models" not in st.session_state:
+    st.session_state.live_models = []
+if "live_models_key" not in st.session_state:
+    st.session_state.live_models_key = None
 
 with st.sidebar:
     st.markdown("### 🛡️ Vendor Risk Console")
@@ -454,9 +472,9 @@ with st.sidebar:
 
     api_key_input = st.text_input(
         "Gemini API key",
-        value=os.getenv("GEMINI_API_KEY", ""),
+        value="",
         type="password",
-        help="Falls back to GEMINI_API_KEY from your .env if left blank.",
+        help="Leave blank to use default environment/.env key, or enter a custom key.",
     )
     company_name = st.text_input("Vendor / company name", placeholder="e.g. Acme Cloud Inc.")
     target_url = st.text_input("Vendor website URL", placeholder="https://www.example.com")
@@ -464,17 +482,28 @@ with st.sidebar:
     with st.expander("Advanced"):
         active_key = api_key_input or os.getenv("GEMINI_API_KEY", "")
 
+        # Model list is only fetched when the user explicitly clicks refresh —
+        # not on every keystroke in the API key field. Streamlit reruns the
+        # whole script on every widget interaction, so an unconditional call
+        # here would fire a live API request (often with a still-incomplete,
+        # invalid key) after every character typed.
         refresh = st.button("🔄 Refresh model list", use_container_width=True)
-        if refresh:
+        if refresh and active_key:
             fetch_available_models.clear()
+            st.session_state.live_models = fetch_available_models(active_key)
+            st.session_state.live_models_key = active_key
 
-        live_models = fetch_available_models(active_key) if active_key else []
+        live_models = (
+            st.session_state.live_models
+            if st.session_state.live_models_key == active_key
+            else []
+        )
         model_options = live_models if live_models else FALLBACK_MODEL_OPTIONS
 
         if live_models:
             st.caption(f"✅ {len(live_models)} models fetched live from your API key")
         else:
-            st.caption("⚠️ Showing offline defaults — add a valid API key to fetch the live list")
+            st.caption("⚠️ Showing offline defaults — click refresh with a valid API key to fetch the live list")
 
         default_index = model_options.index(DEFAULT_MODEL) if DEFAULT_MODEL in model_options else 0
         model_choice = st.selectbox("Model", model_options + ["Custom..."], index=default_index)
@@ -531,8 +560,11 @@ if run_clicked:
             }
             st.session_state.history.append(record)
             st.session_state.current = record
-        except Exception as exc:
-            st.error(f"Audit failed: {exc}")
+        except Exception:
+            # Full traceback goes to server-side logs only — never render raw
+            # exception text (which can echo request/response context) to the UI.
+            logger.error("Audit failed for %s (%s):\n%s", company_name, target_url, traceback.format_exc())
+            st.error("Audit failed. Check your API key and the target URL, then try again.")
 
 if st.session_state.current:
     item = st.session_state.current
