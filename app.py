@@ -119,6 +119,7 @@ use this information to build a comprehensive vendor due diligence dossier and r
 """
 
 MAX_PROMPT_CHARS = 8_000
+MAX_AUDITS_PER_SESSION = 5
 
 VERDICT_STYLES = {
     "pass": {"icon": "✅", "label": "PASS", "bg": "#0f3d24", "fg": "#4ade80", "border": "#16653a"},
@@ -460,6 +461,8 @@ if "history" not in st.session_state:
     st.session_state.history = []
 if "current" not in st.session_state:
     st.session_state.current = None
+if "audit_count" not in st.session_state:
+    st.session_state.audit_count = 0
 if "live_models" not in st.session_state:
     st.session_state.live_models = []
 if "live_models_key" not in st.session_state:
@@ -538,7 +541,10 @@ render_hero()
 
 if run_clicked:
     api_key = api_key_input or os.getenv("GEMINI_API_KEY")
-    if not api_key:
+
+    if st.session_state.audit_count >= MAX_AUDITS_PER_SESSION:
+        st.warning(f"Demo limit reached ({MAX_AUDITS_PER_SESSION} audits per session). Refresh the page to reset, or enter your own API key above for unlimited use.")
+    elif not api_key:
         st.error("Add a Gemini API key in the sidebar (or set GEMINI_API_KEY in your .env).")
     elif not company_name.strip():
         st.error("Enter a vendor / company name.")
@@ -560,9 +566,8 @@ if run_clicked:
             }
             st.session_state.history.append(record)
             st.session_state.current = record
+            st.session_state.audit_count += 1
         except Exception:
-            # Full traceback goes to server-side logs only — never render raw
-            # exception text (which can echo request/response context) to the UI.
             logger.error("Audit failed for %s (%s):\n%s", company_name, target_url, traceback.format_exc())
             st.error("Audit failed. Check your API key and the target URL, then try again.")
 
